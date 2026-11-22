@@ -709,6 +709,15 @@ static int consumer_stop(mlt_consumer consumer)
     mlt_properties properties = MLT_CONSUMER_PROPERTIES(consumer);
     pthread_t *thread = mlt_properties_get_data(properties, "thread", NULL);
 
+    // Called from the consumer thread itself (e.g. by an event listener): it
+    // cannot join itself, and freeing "thread" here would pull the handle out
+    // from under a consumer_start() waiting on it, so only ask it to stop.
+    // The next stop from another thread, or close, joins it.
+    if (thread && pthread_equal(*thread, pthread_self())) {
+        mlt_properties_set_int(properties, "running", 0);
+        return 0;
+    }
+
     // Check that we're running
     if (thread) {
         // Stop the thread

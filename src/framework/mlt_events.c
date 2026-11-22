@@ -193,6 +193,40 @@ int mlt_events_register(mlt_properties self, const char *id)
  * \return the number of listeners
  */
 
+/* Each thread keeps a stack of the properties whose events it is delivering,
+ * so the consumer API can tell when it is called from inside a listener.
+ * "property-changed" is left out: it fires on whatever thread set the
+ * property, not on a thread the consumer owns.
+ */
+typedef struct firing_s
+{
+    mlt_properties owner;
+    struct firing_s *prev;
+} firing_t;
+
+static pthread_key_t firing_key;
+static pthread_once_t firing_once = PTHREAD_ONCE_INIT;
+
+static void firing_key_create(void)
+{
+    pthread_key_create(&firing_key, NULL);
+}
+
+/** Determine if the calling thread is delivering one of this object's events.
+ *
+ * Not exported: the consumer API uses it to refuse lifecycle calls made from
+ * a listener on one of the consumer's own threads.
+ */
+
+int mlt_events_firing(mlt_properties owner)
+{
+    pthread_once(&firing_once, firing_key_create);
+    for (firing_t *f = pthread_getspecific(firing_key); f; f = f->prev)
+        if (f->owner == owner)
+            return 1;
+    return 0;
+}
+
 int mlt_events_fire(mlt_properties self, const char *id, mlt_event_data event_data)
 {
     int result = 0;
@@ -205,6 +239,13 @@ int mlt_events_fire(mlt_properties self, const char *id, mlt_event_data event_da
         listeners = mlt_properties_get_data(list, temp, NULL);
 
         if (listeners != NULL) {
+            int track = strcmp(id, "property-changed") != 0;
+            firing_t firing = {self, NULL};
+            if (track) {
+                pthread_once(&firing_once, firing_key_create);
+                firing.prev = pthread_getspecific(firing_key);
+                pthread_setspecific(firing_key, &firing);
+            }
             for (int i = 0; i < mlt_properties_count(listeners); i++) {
                 mlt_event event = mlt_properties_get_data_at(listeners, i, NULL);
                 if (event != NULL && event->parent != NULL && event->block_count == 0) {
@@ -212,6 +253,8 @@ int mlt_events_fire(mlt_properties self, const char *id, mlt_event_data event_da
                     ++result;
                 }
             }
+            if (track)
+                pthread_setspecific(firing_key, firing.prev);
         }
     }
     return result;

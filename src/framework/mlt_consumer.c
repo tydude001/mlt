@@ -108,8 +108,33 @@ typedef struct
     int consecutive_rendered;
     int process_head;
     atomic_int started;
-    pthread_t *threads; /**< used to deallocate all threads */
+    pthread_t *threads;         /**< used to deallocate all threads */
+    pthread_t lifecycle_thread; /**< the thread that last called mlt_consumer_start */
+    atomic_int has_lifecycle_thread;
 } consumer_private;
+
+extern int mlt_events_firing(mlt_properties owner);
+
+/** Refuse a lifecycle call made from one of this consumer's event listeners on
+ * a thread other than the one that started it, i.e. on a thread the consumer
+ * owns. That thread cannot join itself, and stop or close would free state the
+ * thread is still using (see the note in mlt_consumer.h).
+ */
+
+static int refuse_from_own_listener(mlt_consumer self, const char *call)
+{
+    consumer_private *priv = self->local;
+    // The firing check is thread-local, so a call from outside any listener
+    // returns here without reading state that start() writes.
+    if (!priv || !mlt_events_firing(MLT_CONSUMER_PROPERTIES(self))
+        || !atomic_load(&priv->has_lifecycle_thread)
+        || pthread_equal(priv->lifecycle_thread, pthread_self()))
+        return 0;
+    mlt_log_error(MLT_CONSUMER_SERVICE(self),
+                  "%s() called from an event listener on the consumer's own thread; ignored\n",
+                  call);
+    return 1;
+}
 
 static void mlt_consumer_property_changed(mlt_properties owner, mlt_consumer self, mlt_event_data);
 static void apply_profile_properties(mlt_consumer self,
@@ -482,12 +507,17 @@ int mlt_consumer_start(mlt_consumer self)
         return 1;
     }
 
+    if (refuse_from_own_listener(self, "mlt_consumer_start"))
+        return 1;
+
     int error = 0;
 
     if (!mlt_consumer_is_stopped(self))
         return error;
 
     consumer_private *priv = self->local;
+    priv->lifecycle_thread = pthread_self();
+    atomic_store(&priv->has_lifecycle_thread, 1);
     mlt_profile profile = mlt_service_profile(MLT_CONSUMER_SERVICE(self));
 
     if (!mlt_profile_is_valid(profile)) {
@@ -1682,6 +1712,9 @@ int mlt_consumer_stop(mlt_consumer self)
         return 1;
     }
 
+    if (refuse_from_own_listener(self, "mlt_consumer_stop"))
+        return 1;
+
     // Get the properties
     mlt_properties properties = MLT_CONSUMER_PROPERTIES(self);
     consumer_private *priv = self->local;
@@ -1760,6 +1793,8 @@ int mlt_consumer_is_stopped(mlt_consumer self)
 
 void mlt_consumer_close(mlt_consumer self)
 {
+    if (self != NULL && refuse_from_own_listener(self, "mlt_consumer_close"))
+        return;
     if (self != NULL && mlt_properties_dec_ref(MLT_CONSUMER_PROPERTIES(self)) <= 0) {
         // Get the childs close function
         void (*consumer_close)() = self->close;
